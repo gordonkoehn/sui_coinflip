@@ -1,2 +1,2 @@
 # sui_coinflip
-A reconstruction of the Sui Satoshi Coin Flip repository
+A reconstruction of the Sui [Satoshi Coin Flip repository](Satoshi Coin Flip repository), following the [Sui Satoshi Coin Flip tutorial](https://docs.sui.io/guides/developer/app-examples/coin-flip).
