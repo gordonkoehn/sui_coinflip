@@ -1,4 +1,11 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+/// The core logic of the Satoshi Flip game.
+/// Facilitates the creation of new games, the distribution of funds,
+/// and the cancellation of games.
 module satoshi_flip::single_player_satoshi {
+    // Imports
     use std::string::String;
 
     use sui::coin::{Self, Coin};
@@ -9,9 +16,13 @@ module satoshi_flip::single_player_satoshi {
     use sui::hash::{blake2b256};
     use sui::dynamic_object_field::{Self as dof};
 
+    // Counter library
     use satoshi_flip::counter_nft::Counter;
+
+    // HouseData library
     use satoshi_flip::house_data::HouseData;
 
+    // Consts
     const EPOCHS_CANCEL_AFTER: u64 = 7;
     const GAME_RETURN: u8 = 2;
     const PLAYER_WON_STATE: u8 = 1;
@@ -20,6 +31,7 @@ module satoshi_flip::single_player_satoshi {
     const HEADS: vector<u8> = b"H";
     const TAILS: vector<u8> = b"T";
 
+    // Errors
     const EStakeTooLow: u64 = 0;
     const EStakeTooHigh: u64 = 1;
     const EInvalidBlsSig: u64 = 2;
@@ -28,20 +40,28 @@ module satoshi_flip::single_player_satoshi {
     const EInsufficientHouseBalance: u64 = 5;
     const EGameDoesNotExist: u64 = 6;
 
+    // Events
+
+    /// Emitted when a new game has started.
     public struct NewGame has copy, drop {
         game_id: ID,
         player: address,
         vrf_input: vector<u8>,
         guess: String,
-        user_stake: u64, 
+        user_stake: u64, // 2x user_stake should always equal the total_stake
         fee_bp: u16
     }
 
+    /// Emitted when a game has finished.
     public struct Outcome has copy, drop {
         game_id: ID,
         status: u8
     }
+    // Structs
 
+    // Represents a game and holds the acrued stake.
+    // The guess field could have also been represented as a u8 or boolean, but we chose to use "H" and "T" strings for readability and safety.
+    // Makes it easier for the user to assess if a selection they made on a DApp matches with the txn they are signing on their wallet.
     public struct Game has key, store {
         id: UID,
         guess_placed_epoch: u64,
@@ -52,6 +72,25 @@ module satoshi_flip::single_player_satoshi {
         fee_bp: u16
     }
 
+    /// Function used to create a new game. The player must provide a guess and a Counter NFT.
+    /// Stake is taken from the player's coin and added to the game's stake. The house's stake is also added to the game's stake.
+    public fun start_game(guess: String, counter: &mut Counter, coin: Coin<SUI>, house_data: &mut HouseData, ctx: &mut TxContext): ID {
+        let fee_bp = house_data.base_fee_in_bp();
+        let (id, new_game) = internal_start_game(guess, counter, coin, house_data, fee_bp, ctx);
+
+        dof::add(house_data.borrow_mut(), id, new_game);
+        id
+    }
+
+    /// Function that determines the winner and distributes the funds accordingly.
+    /// If the player wins and fees are = 0, the entire stake balance is transferred to the player.
+    /// If the player wins and fees are > 0, the fees are taken from the stake balance and transferred
+    /// to the house before transferring the rewards to the player.
+    /// If house wins, the entire stake balance is transferred to the house_data's balance field.
+    /// Anyone can end the game (game & house_data objects are shared).
+    /// The BLS signature of the counter id and the counter's count at the time of game creation appended together.
+    /// If an incorrect BLS sig is passed the function will abort.
+    /// An Outcome event is emitted to signal that the game has ended.
     public fun finish_game(game_id: ID, bls_sig: vector<u8>, house_data: &mut HouseData, ctx: &mut TxContext) {
         // Ensure that the game exists.
         assert!(game_exists(house_data, game_id), EGameDoesNotExist);
@@ -100,9 +139,11 @@ module satoshi_flip::single_player_satoshi {
             game_id,
             status
         });
-        }
+    }
 
-        public fun dispute_and_win(house_data: &mut HouseData, game_id: ID, ctx: &mut TxContext) {
+    /// Function used to cancel a game after EPOCHS_CANCEL_AFTER epochs have passed. Can be called by anyone.
+    /// On successful execution the entire game stake is returned to the player.
+    public fun dispute_and_win(house_data: &mut HouseData, game_id: ID, ctx: &mut TxContext) {
         // Ensure that the game exists.
         assert!(game_exists(house_data, game_id), EGameDoesNotExist);
 
@@ -130,35 +171,43 @@ module satoshi_flip::single_player_satoshi {
             status: CHALLENGED_STATE
         });
     }
-        // --------------- Read-only References ---------------
 
+    // --------------- Game Accessors ---------------
+
+    /// Returns the epoch in which the guess was placed.
     public fun guess_placed_epoch(game: &Game): u64 {
         game.guess_placed_epoch
     }
 
+    /// Returns the total stake.
     public fun stake(game: &Game): u64 {
         game.total_stake.value()
     }
 
+    /// Returns the player's guess.
     public fun guess(game: &Game): u8 {
         map_guess(game.guess)
     }
 
+    /// Returns the player's address.
     public fun player(game: &Game): address {
         game.player
     }
 
+    /// Returns the player's vrf_input bytes.
     public fun vrf_input(game: &Game): vector<u8> {
         game.vrf_input
     }
 
+    /// Returns the fee of the game.
     public fun fee_in_bp(game: &Game): u16 {
         game.fee_bp
     }
 
-    // --------------- Helper functions ---------------
+    // --------------- Public Helper functions ---------------
 
-    /// Public helper function to calculate the amount of fees to be paid.
+    /// Helper function to calculate the amount of fees to be paid.
+    /// Fees are only applied on the player's stake.
     public fun fee_amount(game_stake: u64, fee_in_bp: u16): u64 {
         ((((game_stake / (GAME_RETURN as u64)) as u128) * (fee_in_bp as u128) / 10_000) as u64)
     }
@@ -175,7 +224,12 @@ module satoshi_flip::single_player_satoshi {
         dof::borrow(house_data.borrow(), game_id)
     }
 
+    // --------------- Internal Helper functions ---------------
+
     /// Internal helper function used to create a new game.
+    /// The player must provide a guess and a Counter NFT.
+    /// Stake is taken from the player's coin and added to the game's stake.
+    /// The house's stake is also added to the game's stake.
     fun internal_start_game(guess: String, counter: &mut Counter, coin: Coin<SUI>, house_data: &mut HouseData, fee_bp: u16, ctx: &mut TxContext): (ID, Game) {
         // Ensure guess is valid.
         map_guess(guess);
@@ -194,7 +248,7 @@ module satoshi_flip::single_player_satoshi {
         let vrf_input = counter.get_vrf_input_and_increment();
 
         let id = object::new(ctx);
-        let game_id = object::uid_to_inner(&id);
+        let game_id = id.to_inner();
 
         let new_game = Game {
             id,
@@ -222,8 +276,8 @@ module satoshi_flip::single_player_satoshi {
     /// H = 0
     /// T = 1
     fun map_guess(guess: String): u8 {
-        let heads = HEADS;
-        let tails = TAILS;
+    	let heads = HEADS;
+    	let tails = TAILS;
         assert!(guess.bytes() == heads || guess.bytes() == tails, EInvalidGuess);
 
         if (guess.bytes() == heads) {
@@ -232,4 +286,6 @@ module satoshi_flip::single_player_satoshi {
             1
         }
     }
+
+
 }
